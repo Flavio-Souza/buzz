@@ -71,7 +71,7 @@ para o harness escolhido.
 | DMs | Nativo | sempre uma sessão por conversa DM |
 | Memória do agente | Nativo, escopo limitado | core NIP-AE auto-injetado e memória fria on-demand; não compartilha transcript/estado interno entre sessões |
 | Atividade do harness | Nativo | NIP-AO `kind:24200` |
-| Métricas de uso | Nativo, condicionado | NIP-AM `kind:44200`; exige owner e usage compatível. OpenCode ainda não entra no tracker standard |
+| Métricas de uso | Nativo, condicionado | NIP-AM `kind:44200`; exige owner e usage compatível. Tracker agora normaliza Codex, Claude, OpenCode e adapters ACP desconhecidos |
 | Modelo persistente | Nativo | definição e instância |
 | Effort persistente | Parcial | instância local ou payload do provider; não é campo da persona |
 | Troca de modelo ao vivo | Parcial | backend e protocolo existem; controle React não está montado na UI atual |
@@ -203,9 +203,8 @@ texto, reasoning, tools, permissions e usage, mas ainda precisa de prova local.
 
 Há duas limitações genéricas adicionais na ponte atual:
 
-- OpenCode emite `usage_update`, mas o tracker persistente reconhece adapters
-  standard apenas por nome Codex/Claude; o frame aparece no observer, porém não
-  alimenta NIP-AM/FinOps até o parser ser generalizado por formato/capability.
+- OpenCode emite `usage_update`; o tracker agora reconhece o adapter por
+  `agentInfo`/capability e publica o custo acumulado quando o formato o prova.
 - os três adapters anunciam imagem/embedded context, mas `buzz-acp` constrói os
   prompts somente com blocos de texto. Anexos do Buzz ainda não atravessam a
   ponte ACP como conteúdo multimodal.
@@ -399,7 +398,9 @@ simultaneamente `BUZZ_AUTH_TAG` NIP-OA e membership direto no relay. Em relay
 fechado, o caminho de membro direto encerrava a decisão antes de materializar o
 owner; `users.agent_owner_pubkey` ficava NULL e NIP-AO/NIP-AM owner-scoped eram
 recusados. A correção operacional removeu somente o Juri do roster direto,
-manteve o owner humano e reiniciou o agente. Depois disso:
+manteve o owner humano e reiniciou o agente. O relay também recebeu uma
+correção upstream para materializar uma credencial NIP-OA válida mesmo quando o
+agente já é membro direto. Depois disso:
 
 ```text
 users.agent_owner_pubkey = 930907...
@@ -471,12 +472,12 @@ no wrapper. Não há justificativa para um roteador automático de modelos.
 | command apontava para `dist/index.js` | Buzz não reconhecia `codex-acp` | corrigido com bin canônico |
 | `bypassPermissions` não é modo Codex | modo `agent` executava auto-review e bloqueava a publicação inicial | workaround funcional `INITIAL_AGENT_MODE=agent-full-access`; não serve de política para agente público |
 | repo jurídico fixava Sol High | consultas simples usavam configuração cara | runtime agora projeta Luna Max; UI ainda deve ser validada |
-| `AGENTS.md` contém caminhos do host antigo | decisões e comandos inválidos no VPS | pendente no repo jurídico |
-| `./venv/bin/python` não existe no clone | comandos do contrato falham | pendente no repo jurídico |
+| `AGENTS.md` contém caminhos do host antigo | decisões e comandos inválidos no VPS | corrigido e commitado no repo jurídico |
+| `./venv/bin/python` não existe no clone | comandos do contrato falham | `.venv` criado, `venv` legado compatível e suíte validada |
 | `agent.env` e `runtime.env` continham command/mode divergentes | duas fontes de verdade | corrigido: segredos em `agent.env`; política runtime em `runtime.env` |
 | base prompt frio de 17,8 KB + help obrigatório | contexto e ciclo de inferência excessivos em conversa simples | usar `BUZZ_ACP_BASE_PROMPT_FILE` compacto |
-| Docker `json-file` sem rotação | crescimento ilimitado | pendente |
-| binding de sessão volátil | nova sessão após restart do serviço | lacuna upstream |
+| Docker `json-file` sem rotação | crescimento ilimitado | corrigido: `50m × 5` |
+| binding de sessão volátil | nova sessão após restart do serviço | corrigido no `buzz-acp` com SQLite WAL e `session/load` |
 
 `INITIAL_AGENT_MODE=agent-full-access` é configuração oficial do `codex-acp`.
 Ela remove o segundo ciclo de aprovação dentro do Codex. O processo continua
@@ -508,6 +509,9 @@ Turnos medidos:
 |---|---|---:|---|
 | `ta on?` | Sol High | 32,0 s | primeira sessão, CLI e publicação |
 | `quais os ramos...` | Sol High | 173,8 s | skill jurídica, hashes, catálogo, 12 execuções e 2 falhas |
+| `PERSISTENCIA-OK` | Luna Max | ~4 s | sessão criada após o primeiro restart com store durável |
+| `RESTORE-OK` | Luna Max | ~8 s | mesmo `session_id` restaurado após novo restart |
+| `ACTIVITY-OK` | Luna Max | ~4 s | NIP-AO aceito; rejeições auth permaneceram estáveis |
 | teste observer 1 | Luna Max | 25,1 s | publicação falhou por sandbox e foi repetida |
 | teste observer 2 | Luna Max | 39,5 s | mesmo ciclo de falha/repetição; modo Codex ainda era `agent` |
 | turno limpo | Luna Max | 15,5 s | sem falha/retry; primeira sessão ainda consultou `messages send --help` |
@@ -578,15 +582,16 @@ Codex/Claude.
 
 Na implantação atual:
 
-- relay e MinIO usam `json-file` sem `max-size`/`max-file`;
+- relay e MinIO usam `json-file` com `max-size=50m` e `max-file=5`;
 - journald já está limitado globalmente a aproximadamente 256 MB e 7 dias;
 - o `CODEX_HOME` do Juri ocupa cerca de 66 MB, majoritariamente cache/logs;
-- o relay expõe Prometheus em `:9102` somente na rede interna, ainda sem scrape;
-- suporte OTLP existe no Buzz, mas está desabilitado;
-- antes da correção NIP-OA, nenhum evento NIP-AM do Juri era aceito. Após
-  materializar o owner, o primeiro `kind:44200` do Juri foi persistido às
-  11:38:25. FinOps nativo do Juri está validado no caminho Codex; ainda faltam
-  consumo/dashboard e correlação com requester;
+- o relay expõe Prometheus em `:9102`, coletado pelo Prometheus em `10.20.0.1:3310`;
+- OTLP está ativo para Tempo, com traces do serviço `buzz-relay` indexados;
+- Grafana está disponível em `10.20.0.1:3311`, com Prometheus, Loki e Tempo;
+- Loki recebe journald dos units Buzz e do bridge Docker, filtrando serviços da Pleroma;
+- o Juri possui cinco eventos `kind:44200` persistidos, todos com `#p` do owner;
+- NIP-AM/FinOps nativo do Juri está validado no caminho Codex; rateio por requester
+  ainda exige correlação externa porque o evento não identifica o humano;
 - três restarts registraram `Failed to kill control group ... Invalid argument`,
   sem processo órfão observado. A causa precisa ser isolada.
 
