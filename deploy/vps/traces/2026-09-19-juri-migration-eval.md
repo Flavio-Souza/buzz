@@ -38,7 +38,23 @@ each addressed to the owner with a `#p` tag.
 
 ## Remaining gate
 
-The Windows host is visible as WireGuard peer `10.20.0.10`, but TCP/22 is
-still closed. The PowerShell OpenSSH/firewall bootstrap is required before the
-Buzz Dev NSIS build can be cloned and installed side-by-side with the official
-Desktop.
+## Windows Desktop validation
+
+- SSH: `DESKTOP-IF88B2A\flavi@10.20.0.10`
+- Fork clone: `D:\Work\iaquant\LAB\buzz`
+- Build commit: `fa08bc0`
+- Node: `22.18.0`
+- pnpm: `11.4.0`
+- Rust target: `x86_64-pc-windows-msvc`
+- Rust toolchain used by the workspace: `1.95.0`
+- Installer: `Buzz Dev_0.5.23_x64-setup.exe`
+- Installer SHA-256: `58FA6CF9D8F7CEB45CA69962FAE2136F91BE87413080EA48DDD7B628DE84B7A2`
+- Installed product: `Buzz Dev 0.5.23`
+- Installed path: `C:\Users\flavi\AppData\Local\Buzz Dev`
+- Official Buzz remains installed at `C:\Users\flavi\AppData\Local\Buzz`.
+
+The installer and side-by-side registration succeeded. The remaining human
+step is opening Buzz Dev in the interactive Windows desktop session, importing
+the owner identity through native pairing, connecting to `ws://10.20.0.1:3300`
+and opening Activity for the Juri DM/channel. The server-side observer path is
+already proven by the NIP-AO counters above.
