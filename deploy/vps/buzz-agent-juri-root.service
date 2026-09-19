@@ -1,0 +1,43 @@
+[Unit]
+Description=Buzz legal root agent
+Requires=buzz-vps.service
+After=buzz-vps.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=buzz-juri-root
+Group=buzz-juri-root
+UMask=0077
+WorkingDirectory=/srv/buzz-agents/juri-root/workspace/juridico
+Environment=HOME=/srv/buzz-agents/juri-root/home
+Environment=CODEX_HOME=/srv/buzz-agents/juri-root/home/.codex
+Environment=PATH=/opt/buzz-agent-runtime/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/srv/buzz-agents/juri-root/agent.env
+EnvironmentFile=/srv/buzz-agents/juri-root/runtime.env
+ExecStartPre=/usr/bin/test -r /srv/buzz-agents/juri-root/agent.env
+ExecStartPre=/usr/bin/test -r /srv/buzz-agents/juri-root/runtime.env
+ExecStart=/opt/buzz-agent-runtime/bin/buzz-acp
+Restart=on-failure
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=60
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/buzz-agents/juri-root
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

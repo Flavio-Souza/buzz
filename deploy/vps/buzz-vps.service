@@ -1,0 +1,18 @@
+[Unit]
+Description=Buzz private relay on WireGuard
+Requires=docker.service wg-quick@wg0.service
+After=docker.service wg-quick@wg0.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+WorkingDirectory=/home/ubuntu/iaquant/LAB/buzz/deploy/vps
+ExecStart=/usr/bin/docker compose --env-file .env -f compose.yaml up -d --wait relay
+ExecStop=/usr/bin/docker compose --env-file .env -f compose.yaml down
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

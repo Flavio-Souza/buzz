@@ -261,6 +261,41 @@ pub(crate) struct PromptResponseUsage {
 pub(crate) enum StandardAdapterKind {
     Claude,
     Codex,
+    OpenCode,
+    /// Any ACP adapter that reports the standard `session/prompt.usage`
+    /// object but whose provider-specific provenance is unknown.
+    Other,
+}
+
+impl StandardAdapterKind {
+    /// Classify an adapter from either its launch command or ACP `agentInfo`.
+    ///
+    /// Launchers often execute adapters through a generic wrapper (`node`, a
+    /// shell script, or an absolute package path), so this classifier is also
+    /// applied to the identity advertised during `initialize`. Keep unknown
+    /// adapters on the standard path: ACP prompt usage is portable even when
+    /// provider-specific total/cost provenance is not.
+    pub(crate) fn from_identity(identity: &str) -> Self {
+        let lower = identity.to_ascii_lowercase();
+        if lower.contains("opencode") {
+            Self::OpenCode
+        } else if lower.contains("codex") {
+            Self::Codex
+        } else if lower.contains("claude") {
+            Self::Claude
+        } else {
+            Self::Other
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Other => "other",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -274,6 +309,10 @@ struct StandardSessionState {
 pub(crate) struct StandardUsageTracker {
     sessions: HashMap<String, StandardSessionState>,
     in_flight_session: Option<String>,
+    /// A standard ACP `usage_update` was observed during the current turn.
+    /// Used only for diagnostics when the final prompt response omits the
+    /// richer token counters required by NIP-AM.
+    observed_update_session: Option<String>,
     pending_cost: Option<(String, f64)>,
     pending_prompt: Option<(String, PromptResponseUsage, StandardAdapterKind)>,
 }
@@ -291,11 +330,20 @@ impl StandardUsageTracker {
 
     pub(crate) fn begin_turn(&mut self, session_id: &str) {
         self.in_flight_session = Some(session_id.to_string());
+        self.observed_update_session = None;
         self.pending_cost = None;
         self.pending_prompt = None;
     }
 
-    /// Claude's `usage_update.cost.amount` is a raw session-cumulative total.
+    pub(crate) fn observe_usage_update(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            self.observed_update_session = Some(session_id.to_string());
+        }
+    }
+
+    /// Claude/OpenCode `usage_update.cost.amount` is a raw session-cumulative
+    /// total. The ACP client calls this only for adapters with that proven
+    /// semantic.
     pub(crate) fn record_cost(&mut self, session_id: &str, cost: f64) {
         if cost.is_finite() && cost >= 0.0 && self.in_flight_session.as_deref() == Some(session_id)
         {
@@ -314,14 +362,22 @@ impl StandardUsageTracker {
         }
     }
 
-    pub(crate) fn take(&mut self) -> Option<TurnUsage> {
+    /// Consume usage and report whether the adapter emitted a standard
+    /// `usage_update` during the turn. The observation bit lets the production
+    /// ACP client distinguish "adapter reported no usage" from "an update was
+    /// seen but the final counters were absent or malformed".
+    pub(crate) fn take_with_observation(&mut self) -> (Option<TurnUsage>, Option<String>) {
         self.in_flight_session = None;
+        let observed_update_session = self.observed_update_session.take();
         let prompt = self.pending_prompt.take();
         let cost = self.pending_cost.take();
         let session_id = prompt
             .as_ref()
             .map(|(session_id, _, _)| session_id.clone())
-            .or_else(|| cost.as_ref().map(|(session_id, _)| session_id.clone()))?;
+            .or_else(|| cost.as_ref().map(|(session_id, _)| session_id.clone()));
+        let Some(session_id) = session_id else {
+            return (None, observed_update_session);
+        };
 
         let (inclusive_input, output_tokens, total_tokens, cache_read, cache_write) = match prompt {
             Some((_, usage, adapter)) => {
@@ -367,11 +423,11 @@ impl StandardUsageTracker {
         // another valid signal (normally Claude cost) remains; NIP-AM forbids an
         // otherwise all-null usage record.
         if inclusive_input.is_none() && cumulative_cost.is_none() {
-            return None;
+            return (None, observed_update_session);
         }
 
         state.published_seq += 1;
-        Some(TurnUsage {
+        let usage = TurnUsage {
             session_id,
             turn_seq: state.published_seq,
             // Standard prompt counters are per-turn already. A cost-only record
@@ -392,7 +448,8 @@ impl StandardUsageTracker {
             cumulative_cache_write_tokens: None,
             model: None,
             pricing_identity: None,
-        })
+        };
+        (Some(usage), observed_update_session)
     }
 }
 

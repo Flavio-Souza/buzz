@@ -1206,6 +1206,9 @@ struct BgState {
     /// Frames evicted from the bounded pending/in-flight observer buffers since
     /// summary log. Makes overflow loss visible instead of silent.
     gated_observer_dropped: u64,
+    /// Terminal, non-rate-limit observer refusals returned by the relay.
+    /// Logged with each rejection so ownership/policy failures remain visible.
+    observer_frames_rejected: u64,
     /// Channels whose REQ failed during `resubscribe_after_reconnect`.
     ///
     /// A single failed channel REQ is parked here instead of aborting the whole
@@ -1245,6 +1248,7 @@ impl BgState {
             gated_observer_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
+            observer_frames_rejected: 0,
             resubscribe_retry: HashSet::new(),
             connection_generation: 0,
             backoff_step: 0,
@@ -1423,14 +1427,16 @@ impl BgState {
         self.observer_in_flight.push_back(event);
     }
 
-    fn acknowledge_observer_frame(&mut self, event_id: &str) {
+    fn acknowledge_observer_frame(&mut self, event_id: &str) -> bool {
         if let Some(index) = self
             .observer_in_flight
             .iter()
             .position(|event| event.id.to_hex() == event_id)
         {
             self.observer_in_flight.remove(index);
+            return true;
         }
+        false
     }
 }
 
@@ -2541,8 +2547,19 @@ async fn handle_ws_message(
                         );
                         return true;
                     }
-                    state.acknowledge_observer_frame(&event_id);
-                    debug!("OK for event {event_id}: accepted={accepted} message={message}");
+                    let was_observer = state.acknowledge_observer_frame(&event_id);
+                    if !accepted && was_observer {
+                        state.observer_frames_rejected =
+                            state.observer_frames_rejected.saturating_add(1);
+                        warn!(
+                            event_id = %event_id,
+                            rejection = %message,
+                            rejected_total = state.observer_frames_rejected,
+                            "relay rejected observer frame"
+                        );
+                    } else {
+                        debug!("OK for event {event_id}: accepted={accepted} message={message}");
+                    }
                 }
             }
             true
@@ -6526,6 +6543,10 @@ mod tests {
             state.observer_in_flight.is_empty(),
             "a permanently refused frame must be retired from the window"
         );
+        assert_eq!(
+            state.observer_frames_rejected, 1,
+            "terminal observer refusals must be counted instead of disappearing at DEBUG"
+        );
     }
 
     /// Build a signed observer telemetry frame (kind 24200) for gate tests.
@@ -6687,7 +6708,7 @@ mod tests {
 
         state.track_observer_in_flight(Box::new(accepted.clone()));
         state.track_observer_in_flight(Box::new(rejected.clone()));
-        state.acknowledge_observer_frame(&accepted.id.to_hex());
+        let _ = state.acknowledge_observer_frame(&accepted.id.to_hex());
         state.park_gated_observer_frame(Box::new(later.clone()));
         state.requeue_observer_in_flight();
 

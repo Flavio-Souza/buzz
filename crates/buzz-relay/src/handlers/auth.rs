@@ -2,9 +2,11 @@
 //!
 //! Relay membership enforcement uses the shared
 //! [`crate::api::relay_members::enforce_relay_membership`] helper, which supports
-//! NIP-OA owner-delegation fallback on closed relays. On open relays, the auth
-//! handler calls [`crate::api::relay_members::extract_nip_oa_owner`] directly to
-//! extract the owner pubkey for agent→owner backfill (observer frame auth).
+//! NIP-OA owner-delegation fallback on closed relays. The auth handler also
+//! verifies a presented NIP-OA credential for an already-admitted direct member,
+//! so direct membership cannot suppress agent→owner materialization required by
+//! observer-frame authorization. On open relays it performs the same extraction
+//! without using NIP-OA as an admission gate.
 //!
 //! For WebSocket auth, the NIP-OA `auth` tag is extracted from the signed AUTH
 //! event itself (the tag is integrity-protected by the event signature).
@@ -54,6 +56,36 @@ fn classify_relay_membership(
         Ok(MembershipDecision::Denied) => PolicyCheck::Denied,
         Err(_) => PolicyCheck::DependencyError,
     }
+}
+
+/// Resolve the authenticated NIP-OA owner after relay admission succeeds.
+///
+/// `membership_owner` is populated when a closed relay admitted the agent via
+/// its owner. A direct member has already passed admission, but a valid owner
+/// credential still carries authorization metadata that must be materialized
+/// for observer frames and other owner-scoped operations. Closed relays honor
+/// that metadata only when NIP-OA auth is enabled; open relays preserve their
+/// existing opportunistic owner-discovery behavior.
+fn resolve_authenticated_owner(
+    membership_owner: Option<nostr::PublicKey>,
+    require_relay_membership: bool,
+    allow_nip_oa_auth: bool,
+    auth_tag_json: Option<&str>,
+    agent_pubkey: &nostr::PublicKey,
+    signed_auth_created_at: u64,
+) -> Option<nostr::PublicKey> {
+    membership_owner.or_else(|| {
+        let should_extract =
+            auth_tag_json.is_some() && (!require_relay_membership || allow_nip_oa_auth);
+        if !should_extract {
+            return None;
+        }
+        crate::api::relay_members::extract_nip_oa_owner(
+            agent_pubkey.as_bytes(),
+            auth_tag_json,
+            Some(signed_auth_created_at),
+        )
+    })
 }
 
 fn ban_denial(outcome: BanOutcome) -> Option<(&'static str, &'static str, AuthOutcome)> {
@@ -313,21 +345,18 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             };
 
-            // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
-            // (needed for observer frame auth). Only runs on open relays — on closed
-            // relays, enforce_relay_membership already handles NIP-OA delegation.
-            // No feature flag needed: NIP-OA is cryptographically self-proving.
-            let nip_oa_owner = nip_oa_owner.or_else(|| {
-                if !state.config.require_relay_membership && auth_tag_json.is_some() {
-                    crate::api::relay_members::extract_nip_oa_owner(
-                        pubkey.as_bytes(),
-                        auth_tag_json.as_deref(),
-                        Some(signed_auth_created_at),
-                    )
-                } else {
-                    None
-                }
-            });
+            // Resolve owner metadata independently from the admission route.
+            // A direct member may still be an agent presenting a valid NIP-OA
+            // credential; skipping it here leaves `agent_owner_pubkey` unset and
+            // makes every kind:24200 frame fail authorization.
+            let nip_oa_owner = resolve_authenticated_owner(
+                nip_oa_owner,
+                state.config.require_relay_membership,
+                state.config.allow_nip_oa_auth,
+                auth_tag_json.as_deref(),
+                &pubkey,
+                signed_auth_created_at,
+            );
 
             // Stash NIP-OA owner on the auth context only after the shared
             // backfill confirms the first-write-wins relationship.
@@ -379,7 +408,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 mod tests {
     use super::{
         ban_denial, classify_allowlist, classify_relay_membership, extract_auth_tag_json,
-        handle_auth, BanOutcome, PolicyCheck,
+        handle_auth, resolve_authenticated_owner, BanOutcome, PolicyCheck,
     };
     use crate::api::relay_members::MembershipDecision;
     use crate::connection::{tests::test_conn_with_auth, AuthState};
@@ -423,6 +452,65 @@ mod tests {
             challenge: challenge.to_owned(),
             started_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn direct_member_nip_oa_credential_resolves_owner_on_closed_relay() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+            .expect("compute auth tag");
+
+        let resolved = resolve_authenticated_owner(
+            None,
+            true,
+            true,
+            Some(&auth_tag),
+            &agent.public_key(),
+            nostr::Timestamp::now().as_secs(),
+        );
+
+        assert_eq!(resolved, Some(owner.public_key()));
+    }
+
+    #[test]
+    fn closed_relay_with_nip_oa_disabled_does_not_resolve_direct_member_owner() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+            .expect("compute auth tag");
+
+        assert_eq!(
+            resolve_authenticated_owner(
+                None,
+                true,
+                false,
+                Some(&auth_tag),
+                &agent.public_key(),
+                nostr::Timestamp::now().as_secs(),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn open_relay_preserves_opportunistic_nip_oa_owner_discovery() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+            .expect("compute auth tag");
+
+        assert_eq!(
+            resolve_authenticated_owner(
+                None,
+                false,
+                false,
+                Some(&auth_tag),
+                &agent.public_key(),
+                nostr::Timestamp::now().as_secs(),
+            ),
+            Some(owner.public_key()),
+        );
     }
 
     /// Build a signed NIP-98 (kind 27235) event carrying the given tags. The
@@ -662,5 +750,185 @@ mod tests {
             metric_counter(&snapshot, "buzz_auth_attempts_total", None),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    use std::{
+        collections::HashMap,
+        sync::{atomic::AtomicU8, Arc, Mutex as StdMutex},
+        time::Instant,
+    };
+
+    use axum::extract::ws::Message as WsMessage;
+    use buzz_core::{observer::encrypt_observer_payload, TenantContext};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use tokio::sync::{mpsc, Mutex};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use crate::{
+        connection::{AuthState, ConnectionState},
+        handlers::{auth::handle_auth, event::handle_event},
+    };
+
+    fn test_connection(
+        tenant: TenantContext,
+        challenge: &str,
+    ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
+        let (send_tx, send_rx) = mpsc::channel(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(4);
+        let conn = ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant,
+            remote_addr: "127.0.0.1:1234".parse().expect("socket address"),
+            auth_state: StdMutex::new(AuthState::Pending {
+                challenge: challenge.to_owned(),
+                started_at: Instant::now(),
+            }),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 3,
+        };
+        (Arc::new(conn), send_rx)
+    }
+
+    fn parse_ok(frame: WsMessage) -> serde_json::Value {
+        let WsMessage::Text(text) = frame else {
+            panic!("expected text relay frame");
+        };
+        serde_json::from_str(&text).expect("relay frame JSON")
+    }
+
+    /// Production-seam regression for the deployed failure: the agent is
+    /// already a direct relay member, but also presents a valid owner
+    /// attestation. AUTH must materialize that owner and the resulting
+    /// authenticated connection must be able to publish kind:24200 telemetry.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL and Redis"]
+    async fn direct_member_auth_materializes_owner_and_authorizes_observer_frame() {
+        let database_url = crate::test_support::database_url();
+        let host = format!("observer-direct-member-{}.example", Uuid::new_v4());
+        let mut config = crate::config::Config::from_env().expect("config from env");
+        config.database_url = database_url.clone();
+        config.read_database_url = None;
+        config.redis_url = std::env::var("BUZZ_TEST_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+        config.relay_url = format!("wss://{host}");
+        config.require_relay_membership = true;
+        config.allow_nip_oa_auth = true;
+        config.pubkey_allowlist_enabled = false;
+
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("requires reachable PostgreSQL");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure test community");
+        let tenant = TenantContext::resolved(community.id, &host);
+
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        db.add_relay_member(community.id, &owner_hex, "owner", None)
+            .await
+            .expect("add owner relay member");
+        db.add_relay_member(community.id, &agent_hex, "member", Some(&owner_hex))
+            .await
+            .expect("add direct agent relay member");
+
+        let state =
+            crate::state::tests::test_state_with_config_and_database_pool(config, pool.clone())
+                .await;
+
+        let challenge = "direct-member-owner-materialization";
+        let (conn, mut send_rx) = test_connection(tenant, challenge);
+        let auth_tag_json = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+            .expect("compute owner attestation");
+        let auth_tag_parts: Vec<String> =
+            serde_json::from_str(&auth_tag_json).expect("auth tag JSON");
+        let auth_tag = Tag::parse(auth_tag_parts).expect("parse auth tag");
+        let relay_tag = Tag::parse(["relay", state.config.relay_url.as_str()]).expect("relay tag");
+        let challenge_tag = Tag::parse(["challenge", challenge]).expect("challenge tag");
+        let auth_event = EventBuilder::new(Kind::Authentication, "")
+            .tags([relay_tag, challenge_tag, auth_tag])
+            .sign_with_keys(&agent)
+            .expect("sign AUTH event");
+
+        handle_auth(auth_event, Arc::clone(&conn), Arc::clone(&state)).await;
+        let auth_ok = parse_ok(send_rx.recv().await.expect("AUTH response"));
+        assert_eq!(auth_ok[2], true, "direct-member AUTH must succeed");
+        let AuthState::Authenticated(auth_ctx) = conn.auth_state_snapshot() else {
+            panic!("connection must be authenticated");
+        };
+        assert_eq!(auth_ctx.agent_owner_pubkey, Some(owner.public_key()));
+        assert!(
+            state
+                .db
+                .is_agent_owner(
+                    community.id,
+                    agent.public_key().as_bytes(),
+                    owner.public_key().as_bytes(),
+                )
+                .await
+                .expect("query materialized owner"),
+            "AUTH must persist the owner relationship used by observer authorization"
+        );
+
+        let encrypted = encrypt_observer_payload(
+            &agent,
+            &owner.public_key(),
+            &serde_json::json!({"kind":"turn_started","payload":{}}),
+        )
+        .expect("encrypt observer payload");
+        let observer = buzz_sdk::build_agent_observer_frame(
+            &owner_hex,
+            &agent_hex,
+            buzz_core::observer::OBSERVER_FRAME_TELEMETRY,
+            &encrypted,
+        )
+        .expect("build observer frame")
+        .sign_with_keys(&agent)
+        .expect("sign observer frame");
+        handle_event(observer, conn, Arc::clone(&state)).await;
+        let observer_ok = parse_ok(send_rx.recv().await.expect("observer response"));
+        assert_eq!(
+            observer_ok[2], true,
+            "materialized direct-member owner must authorize kind:24200"
+        );
+
+        sqlx::query("DELETE FROM events WHERE community_id = $1")
+            .bind(community.id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean events");
+        sqlx::query("DELETE FROM audit_log WHERE community_id = $1")
+            .bind(community.id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean audit log");
+        sqlx::query("DELETE FROM relay_members WHERE community_id = $1")
+            .bind(community.id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean relay members");
+        sqlx::query("DELETE FROM users WHERE community_id = $1")
+            .bind(community.id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean users");
+        sqlx::query("DELETE FROM communities WHERE id = $1")
+            .bind(community.id.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean community");
     }
 }

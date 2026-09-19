@@ -1,0 +1,42 @@
+[Unit]
+Description=Buzz host agent %i
+Requires=buzz-vps.service
+After=buzz-vps.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+UMask=0077
+WorkingDirectory=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/workspace
+Environment=HOME=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/home
+Environment=CODEX_HOME=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/home/.codex
+Environment=CLAUDE_CONFIG_DIR=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/home/.claude
+Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/iaquant/LAB/buzz/.local/sprig:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/agent.env
+ExecStartPre=/usr/bin/test -r /home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/agent.env
+ExecStart=/home/ubuntu/iaquant/LAB/buzz/.local/sprig/buzz-acp
+Restart=on-failure
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=60
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/home
+ReadWritePaths=/home/ubuntu/iaquant/LAB/buzz/deploy/vps/agents/%i/workspace
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

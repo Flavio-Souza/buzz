@@ -363,6 +363,25 @@ pub struct CliArgs {
     )]
     pub session_policy: crate::scope::SessionPolicy,
 
+    /// SQLite database used to persist `SessionScope -> ACP sessionId` bindings.
+    /// Defaults to `$HOME/.local/state/buzz-acp/session-bindings.sqlite3`.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_SESSION_STORE",
+        conflicts_with = "no_session_store"
+    )]
+    pub session_store: Option<PathBuf>,
+
+    /// Disable durable ACP session bindings and use process memory only.
+    #[arg(long, env = "BUZZ_ACP_NO_SESSION_STORE")]
+    pub no_session_store: bool,
+
+    /// Compatibility fence for persisted ACP sessions. Change this whenever
+    /// persona, workspace, model policy, or other standing session state becomes
+    /// incompatible with sessions created by the previous deployment.
+    #[arg(long, env = "BUZZ_ACP_SESSION_REVISION", default_value = "1")]
+    pub session_revision: String,
+
     /// How to handle new @mentions while a turn is already in-flight.
     /// steer (default): cancel+re-prompt, framing the new mention as a message
     /// that arrived mid-task — the agent keeps working and weaves it in.
@@ -560,6 +579,10 @@ pub struct Config {
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
+    /// Optional SQLite path for durable ACP session bindings.
+    pub session_store_path: Option<PathBuf>,
+    /// Operator-controlled compatibility fence for durable bindings.
+    pub session_revision: String,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
@@ -629,6 +652,47 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+}
+
+fn resolve_session_store_path(
+    override_path: Option<PathBuf>,
+    disabled: bool,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    if disabled {
+        if override_path.is_some() {
+            return Err(ConfigError::ConfigFile(
+                "--no-session-store conflicts with --session-store".into(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    if let Some(path) = override_path {
+        if !path.is_absolute() {
+            return Err(ConfigError::ConfigFile(
+                "BUZZ_ACP_SESSION_STORE must be an absolute path".into(),
+            ));
+        }
+        return Ok(Some(path));
+    }
+
+    let home = home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            ConfigError::ConfigFile(
+                "HOME is unset; set BUZZ_ACP_SESSION_STORE to an absolute path or explicitly disable persistence with BUZZ_ACP_NO_SESSION_STORE=true".into(),
+            )
+        })?;
+    if !home.is_absolute() {
+        return Err(ConfigError::ConfigFile(
+            "HOME must be absolute to derive the default ACP session store".into(),
+        ));
+    }
+    Ok(Some(
+        home.join(".local/state/buzz-acp/session-bindings.sqlite3"),
+    ))
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1150,6 +1214,21 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let session_store_path = resolve_session_store_path(
+            args.session_store,
+            args.no_session_store,
+            std::env::var_os("HOME").as_deref(),
+        )?;
+        let session_revision = args.session_revision.trim().to_string();
+        if session_revision.is_empty()
+            || session_revision.len() > 128
+            || session_revision.chars().any(char::is_control)
+        {
+            return Err(ConfigError::ConfigFile(
+                "BUZZ_ACP_SESSION_REVISION must be 1-128 printable characters".into(),
+            ));
+        }
+
         let config = Config {
             keys,
             relay_url: args.relay_url,
@@ -1173,6 +1252,8 @@ impl Config {
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
+            session_store_path,
+            session_revision,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
@@ -1552,6 +1633,8 @@ mod tests {
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
+            session_store_path: None,
+            session_revision: "1".into(),
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -3158,6 +3241,47 @@ channels = "ALL"
             "Fizz · #buzz-dev"
         );
         assert_eq!(compose_scoped_session_title("Fizz", None, None), "Fizz");
+    }
+
+    #[test]
+    fn session_store_defaults_under_home_and_accepts_absolute_override() {
+        let home = std::env::current_dir()
+            .expect("current directory")
+            .join("test-agent-home");
+        let default = resolve_session_store_path(None, false, Some(home.as_os_str()))
+            .expect("derive default store");
+        assert_eq!(
+            default,
+            Some(home.join(".local/state/buzz-acp/session-bindings.sqlite3"))
+        );
+
+        let override_path = std::env::current_dir()
+            .expect("current directory")
+            .join("override-sessions.sqlite3");
+        assert_eq!(
+            resolve_session_store_path(Some(override_path.clone()), false, Some(home.as_os_str()),)
+                .expect("accept override"),
+            Some(override_path)
+        );
+    }
+
+    #[test]
+    fn session_store_requires_explicit_opt_out() {
+        let home = std::env::current_dir()
+            .expect("current directory")
+            .join("test-agent-home");
+        assert_eq!(
+            resolve_session_store_path(None, true, Some(home.as_os_str()))
+                .expect("explicit opt-out"),
+            None
+        );
+        assert!(resolve_session_store_path(None, false, None).is_err());
+        assert!(resolve_session_store_path(
+            Some(PathBuf::from("relative.sqlite3")),
+            false,
+            Some(home.as_os_str()),
+        )
+        .is_err());
     }
 
     /// Every arg whose env var name contains KEY/SECRET/TOKEN/PASSWORD/CRED/AUTH

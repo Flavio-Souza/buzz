@@ -15,6 +15,15 @@ __pycache__/
 .env.local
 .env.*.local
 
+# VPS deployment state and agent credentials/workspaces.
+/deploy/vps/.env
+/deploy/vps/data/
+/deploy/vps/agents/*/agent.env
+/deploy/vps/agents/*/identity.txt
+/deploy/vps/agents/*/instructions.md
+/deploy/vps/agents/*/home/
+/deploy/vps/agents/*/workspace/
+
 # Editor / IDE
 .idea/
 .vscode/*

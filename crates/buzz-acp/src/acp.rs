@@ -111,6 +111,9 @@ pub enum AcpError {
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
+
+    #[error("Session store error: {0}")]
+    SessionStore(String),
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -203,6 +206,9 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the adapter advertised `agentCapabilities.loadSession: true`.
+    /// This is the only gate for sending `session/load`.
+    load_session_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -213,10 +219,12 @@ pub struct AcpClient {
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
-    /// Per-turn prompt-response usage and Claude's optional cumulative cost.
+    /// Per-turn prompt-response usage and adapter-reported cumulative cost.
     standard_usage: StandardUsageTracker,
-    /// Known adapter identity for prompt-response usage mapping.
-    standard_adapter: Option<StandardAdapterKind>,
+    /// Adapter identity for prompt-response usage mapping. Unknown adapters
+    /// still use the portable ACP counters; only provider-specific provenance
+    /// (Codex total, Claude cumulative cost) depends on this classification.
+    standard_adapter: StandardAdapterKind,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -538,14 +546,8 @@ impl AcpClient {
         // console-subsystem child process spawned from a GUI/non-console parent.
         configure_no_window(&mut cmd);
 
-        let standard_adapter =
-            match crate::config::normalize_agent_command_identity(command).as_str() {
-                "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => {
-                    Some(StandardAdapterKind::Claude)
-                }
-                "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
-                _ => None,
-            };
+        let command_identity = crate::config::normalize_agent_command_identity(command);
+        let standard_adapter = StandardAdapterKind::from_identity(&command_identity);
         let mut child = cmd.spawn()?;
 
         let stdin = child
@@ -571,6 +573,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            load_session_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -629,8 +632,44 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.load_session_supported = result
+            .pointer("/agentCapabilities/loadSession")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // The adapter's self-declared identity is more reliable than argv:
+        // remote launchers and custom harness definitions commonly invoke a
+        // generic `node`/shell wrapper. Falling back to the command-derived
+        // identity keeps older adapters that omit `agentInfo` working.
+        let advertised_identity = result
+            .pointer("/agentInfo/name")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                result
+                    .pointer("/agentInfo/title")
+                    .and_then(|value| value.as_str())
+            });
+        if let Some(identity) = advertised_identity {
+            let advertised = StandardAdapterKind::from_identity(identity);
+            if advertised != StandardAdapterKind::Other {
+                if self.standard_adapter != advertised {
+                    tracing::info!(
+                        target: "acp::usage",
+                        command_adapter = self.standard_adapter.label(),
+                        advertised_adapter = advertised.label(),
+                        agent_info = identity,
+                        "using ACP agentInfo identity for usage normalization"
+                    );
+                }
+                self.standard_adapter = advertised;
+            }
+        }
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Whether the initialized adapter explicitly supports `session/load`.
+    pub(crate) fn load_session_supported(&self) -> bool {
+        self.load_session_supported
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -717,6 +756,33 @@ impl AcpClient {
             .session_new_full(cwd, mcp_servers, system_prompt, session_title)
             .await?
             .session_id)
+    }
+
+    /// Load an existing ACP session and return the adapter's current session
+    /// configuration snapshot. The opaque `session_id` comes from a previous
+    /// successful `session/new`; callers must gate this method on
+    /// [`Self::load_session_supported`].
+    pub async fn session_load_full(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<SessionNewResponse, AcpError> {
+        let result = self
+            .send_request(
+                "session/load",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+            .await?;
+        tracing::info!(target: "acp::session", "session loaded: {session_id}");
+        Ok(SessionNewResponse {
+            session_id: session_id.to_string(),
+            raw: result,
+        })
     }
 
     /// Replace Goose's native system prompt after `session/new`.
@@ -903,7 +969,18 @@ impl AcpClient {
     /// goose emitted nothing for this turn.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         let goose_usage = self.goose_usage.take();
-        let standard_usage = self.standard_usage.take();
+        let (standard_usage, observed_standard_update_session) =
+            self.standard_usage.take_with_observation();
+        if goose_usage.is_none() && standard_usage.is_none() {
+            if let Some(session_id) = observed_standard_update_session {
+                tracing::warn!(
+                    target: "acp::usage",
+                    adapter = self.standard_adapter.label(),
+                    session_id,
+                    "ACP usage_update was observed, but the completed prompt supplied no publishable NIP-AM counters"
+                );
+            }
+        }
         goose_usage.or(standard_usage)
     }
 
@@ -1874,16 +1951,31 @@ impl AcpClient {
     /// Claude. Unlike Goose's payload, `used`/`size` are context occupancy and
     /// are intentionally not mapped to token accounting.
     fn handle_standard_usage_update(&mut self, msg: &serde_json::Value) {
-        if self.standard_adapter != Some(StandardAdapterKind::Claude) {
-            return;
-        }
         let session_id = match msg
             .pointer("/params/sessionId")
             .and_then(serde_json::Value::as_str)
         {
             Some(session_id) => session_id,
-            None => return,
+            None => {
+                tracing::warn!(
+                    target: "acp::usage",
+                    adapter = self.standard_adapter.label(),
+                    "ACP usage_update omitted params.sessionId"
+                );
+                return;
+            }
         };
+        self.standard_usage.observe_usage_update(session_id);
+
+        // `cost.amount` is session-cumulative in claude-agent-acp and OpenCode.
+        // Other adapters use `used`/`size` for context occupancy, which must
+        // not be misreported as billable turn tokens or cumulative cost.
+        if !matches!(
+            self.standard_adapter,
+            StandardAdapterKind::Claude | StandardAdapterKind::OpenCode
+        ) {
+            return;
+        }
         let cost = match msg
             .pointer("/params/update/cost/amount")
             .and_then(serde_json::Value::as_f64)
@@ -2032,17 +2124,21 @@ impl AcpClient {
         result: &serde_json::Value,
     ) -> Result<StopReason, AcpError> {
         let stop_reason = self.parse_stop_reason(result)?;
-        if let Some(adapter) = self.standard_adapter {
-            match serde_json::from_value::<PromptResponseUsage>(result["usage"].clone()) {
-                Ok(usage) => self
-                    .standard_usage
-                    .record_prompt_usage(session_id, usage, adapter),
-                Err(_) if result.get("usage").is_some() => tracing::debug!(
-                    target: "acp::usage",
-                    "session/prompt response contained malformed standard usage"
-                ),
-                Err(_) => {}
+        match serde_json::from_value::<PromptResponseUsage>(result["usage"].clone()) {
+            Ok(usage) => {
+                self.standard_usage
+                    .record_prompt_usage(session_id, usage, self.standard_adapter)
             }
+            Err(error) if result.get("usage").is_some_and(|usage| !usage.is_null()) => {
+                tracing::warn!(
+                    target: "acp::usage",
+                    adapter = self.standard_adapter.label(),
+                    session_id,
+                    error = %error,
+                    "session/prompt response contained malformed standard usage"
+                );
+            }
+            Err(_) => {}
         }
         Ok(stop_reason)
     }
@@ -3510,6 +3606,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_gates_and_session_load_uses_persisted_id() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"configOptions":[],"_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        assert!(client.load_session_supported());
+
+        let response = client
+            .session_load_full("thread-existing", "/tmp", vec![])
+            .await
+            .expect("session/load should succeed");
+        assert_eq!(response.session_id, "thread-existing");
+        let received = &response.raw["_receivedRequest"];
+        assert_eq!(received["method"], "session/load");
+        assert_eq!(received["params"]["sessionId"], "thread-existing");
+        assert_eq!(received["params"]["cwd"], "/tmp");
+        assert_eq!(received["params"]["mcpServers"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn goose_system_prompt_request_uses_set_contract() {
         let script = r#"
             read -t 2 REQ
@@ -4372,7 +4496,7 @@ mod tests {
     #[tokio::test]
     async fn claude_prompt_response_usage_merges_with_cumulative_cost() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_adapter = StandardAdapterKind::Claude;
         client.notify_session_spawned("claude-session");
         client.standard_usage.begin_turn("claude-session");
         client.handle_session_update(&standard_cost_update("claude-session", 0.042));
@@ -4405,7 +4529,7 @@ mod tests {
     #[tokio::test]
     async fn codex_prompt_response_usage_preserves_provider_total_without_cost() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Codex);
+        client.standard_adapter = StandardAdapterKind::Codex;
         client.standard_usage.begin_turn("codex-session");
         client.handle_session_update(&standard_cost_update("codex-session", 0.042));
         client
@@ -4431,9 +4555,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_adapter_still_records_portable_prompt_usage() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = StandardAdapterKind::Other;
+        client.standard_usage.begin_turn("portable-session");
+        client
+            .parse_prompt_response(
+                "portable-session",
+                &prompt_response_usage(90, 10, 140, Some(40), None),
+            )
+            .unwrap();
+
+        let usage = client.take_turn_usage().expect("portable ACP usage");
+        assert_eq!(usage.turn_input_tokens, Some(130));
+        assert_eq!(usage.turn_output_tokens, Some(10));
+        assert_eq!(usage.turn_cache_read_tokens, Some(40));
+        assert_eq!(
+            usage.turn_total_tokens, None,
+            "unknown adapters must not claim provider-total provenance"
+        );
+    }
+
+    #[tokio::test]
     async fn standard_prompt_input_overflow_fails_closed() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_adapter = StandardAdapterKind::Claude;
         client.standard_usage.begin_turn("overflow-session");
         client
             .parse_prompt_response(
@@ -4459,7 +4605,7 @@ mod tests {
             sleep 1
         "#;
         let (mut client, dir) = spawn_named_script("claude-code", script).await;
-        assert_eq!(client.standard_adapter, Some(StandardAdapterKind::Claude));
+        assert_eq!(client.standard_adapter, StandardAdapterKind::Claude);
         client.notify_session_spawned("wire-session");
 
         let stop = client
@@ -4483,10 +4629,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Regression for remote/custom launchers that invoke codex-acp through a
+    /// generic wrapper. The production `initialize` response must reclassify
+    /// the adapter before the real prompt read loop records usage; deleting
+    /// either the agentInfo classification or generic prompt parser makes this
+    /// test fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_agent_info_drives_wire_usage_through_generic_wrapper() {
+        let script = r#"
+            read -r INIT
+            INIT_ID=$(printf '%s' "$INIT" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            echo '{"jsonrpc":"2.0","id":'"$INIT_ID"',"result":{"protocolVersion":1,"agentInfo":{"name":"@agentclientprotocol/codex-acp","title":"Codex","version":"1.12.0"},"agentCapabilities":{}}}'
+            read -r PROMPT
+            PROMPT_ID=$(printf '%s' "$PROMPT" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wire-codex","update":{"sessionUpdate":"usage_update","used":140,"size":258400}}}'
+            echo '{"jsonrpc":"2.0","id":'"$PROMPT_ID"',"result":{"stopReason":"end_turn","usage":{"inputTokens":90,"outputTokens":10,"totalTokens":140,"cachedReadTokens":40}}}'
+            sleep 1
+        "#;
+        let (mut client, dir) = spawn_named_script("generic-wrapper", script).await;
+        assert_eq!(client.standard_adapter, StandardAdapterKind::Other);
+
+        client.initialize().await.expect("initialize");
+        assert_eq!(client.standard_adapter, StandardAdapterKind::Codex);
+        client.notify_session_spawned("wire-codex");
+
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                "wire-codex",
+                "hello",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("wire prompt");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let usage = client.take_turn_usage().expect("wire Codex usage");
+        assert_eq!(usage.turn_input_tokens, Some(130));
+        assert_eq!(usage.turn_output_tokens, Some(10));
+        assert_eq!(usage.turn_total_tokens, Some(140));
+        assert_eq!(usage.turn_cache_read_tokens, Some(40));
+        drop(client);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn claude_cost_only_record_survives_missing_prompt_usage() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_adapter = StandardAdapterKind::Claude;
         client.notify_session_spawned("cost-only-session");
         client.standard_usage.begin_turn("cost-only-session");
         client.handle_session_update(&standard_cost_update("cost-only-session", 0.125));
@@ -4500,9 +4691,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opencode_cost_update_produces_portable_nip_am_usage() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = StandardAdapterKind::from_identity("opencode");
+        assert_eq!(client.standard_adapter, StandardAdapterKind::OpenCode);
+        client.notify_session_spawned("opencode-session");
+        client.standard_usage.begin_turn("opencode-session");
+        client.handle_session_update(&standard_cost_update("opencode-session", 0.25));
+
+        let usage = client.take_turn_usage().expect("OpenCode cost usage");
+        assert_eq!(usage.turn_seq, 1);
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, None);
+        assert_eq!(usage.turn_cost_usd, Some(0.25));
+        assert_eq!(usage.cumulative_cost_usd, Some(0.25));
+    }
+
+    #[tokio::test]
     async fn attached_claude_session_does_not_invent_first_cost_delta() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_adapter = StandardAdapterKind::Claude;
         client.standard_usage.begin_turn("attached-session");
         client.handle_session_update(&standard_cost_update("attached-session", 1.25));
         client
@@ -4520,7 +4728,7 @@ mod tests {
     #[tokio::test]
     async fn standard_usage_two_prompts_preserve_both_monotonic_sequences() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_adapter = StandardAdapterKind::Claude;
         client.notify_session_spawned("two-prompt-session");
 
         client.standard_usage.begin_turn("two-prompt-session");
@@ -4557,7 +4765,7 @@ mod tests {
     #[tokio::test]
     async fn goose_usage_stays_exclusive_and_drains_standard_usage() {
         let mut client = spawn_inert_client().await;
-        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_adapter = StandardAdapterKind::Claude;
         client.goose_usage.begin_turn("goose-session");
         client.standard_usage.begin_turn("goose-session");
         client.handle_goose_usage_update(&goose_usage_update_msg("goose-session", 1000, 200, None));

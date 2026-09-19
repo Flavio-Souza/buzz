@@ -1,0 +1,39 @@
+// The agents write to journald directly. The optional buzz-container-logs unit
+// mirrors only relay/MinIO stdout from Docker into journald. Keep those Buzz
+// units before forwarding so unrelated Pleroma logs do not enter this stack.
+loki.source.journal "host" {
+	path          = "/var/log/journal"
+	max_age       = "24h"
+	relabel_rules = loki.relabel.buzz_units.rules
+	labels        = {
+		job  = "systemd-journal",
+		host = constants.hostname,
+	}
+	forward_to = [loki.write.local.receiver]
+}
+
+loki.relabel "buzz_units" {
+	forward_to = []
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		regex         = "buzz-(agent.*|vps|container-logs)\\.service"
+		action        = "keep"
+	}
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		target_label  = "unit"
+	}
+
+	rule {
+		source_labels = ["__journal_priority_keyword"]
+		target_label  = "level"
+	}
+}
+
+loki.write "local" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

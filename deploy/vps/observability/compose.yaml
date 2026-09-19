@@ -1,0 +1,187 @@
+name: buzz-observability
+
+x-observability-logging: &observability-json-logging
+  driver: json-file
+  options:
+    max-size: "${BUZZ_DOCKER_LOG_MAX_SIZE:-50m}"
+    max-file: "${BUZZ_DOCKER_LOG_MAX_FILES:-5}"
+
+x-observability-security: &observability-security
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  restart: unless-stopped
+
+services:
+  prometheus:
+    <<: *observability-security
+    image: ${BUZZ_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${BUZZ_PROMETHEUS_RETENTION:-15d}
+      - --storage.tsdb.retention.size=${BUZZ_PROMETHEUS_RETENTION_SIZE:-5GB}
+    ports:
+      - "${BUZZ_BIND_HOST:-10.20.0.1}:${BUZZ_PROMETHEUS_PORT:-3310}:9090"
+    volumes:
+      - type: bind
+        source: ./prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+      - type: volume
+        source: prometheus-data
+        target: /prometheus
+    networks:
+      - buzz-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: ${BUZZ_PROMETHEUS_MEMORY_LIMIT:-768m}
+    pids_limit: 256
+    logging: *observability-json-logging
+
+  grafana:
+    <<: *observability-security
+    image: ${BUZZ_GRAFANA_IMAGE:-grafana/grafana:12.1.0@sha256:6ac590e7cabc2fbe8d7b8fc1ce9c9f0582177b334e0df9c927ebd9670469440f}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${BUZZ_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${BUZZ_GRAFANA_ADMIN_PASSWORD:?set BUZZ_GRAFANA_ADMIN_PASSWORD in deploy/vps/.env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_LOG_MODE: console
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "${BUZZ_BIND_HOST:-10.20.0.1}:${BUZZ_GRAFANA_PORT:-3311}:3000"
+    volumes:
+      - type: bind
+        source: ./grafana/provisioning/datasources
+        target: /etc/grafana/provisioning/datasources
+        read_only: true
+      - type: volume
+        source: grafana-data
+        target: /var/lib/grafana
+    networks:
+      - buzz-net
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: ${BUZZ_GRAFANA_MEMORY_LIMIT:-512m}
+    pids_limit: 256
+    logging: *observability-json-logging
+
+  loki:
+    <<: *observability-security
+    image: ${BUZZ_LOKI_IMAGE:-grafana/loki:3.5.3@sha256:3165cecce301ce5b9b6e3530284b080934a05cd5cafac3d3d82edcb887b45ecd}
+    command:
+      - -config.file=/etc/loki/loki.yaml
+    volumes:
+      - type: bind
+        source: ./loki/loki.yaml
+        target: /etc/loki/loki.yaml
+        read_only: true
+      - type: volume
+        source: loki-data
+        target: /loki
+    networks:
+      - buzz-net
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: ${BUZZ_LOKI_MEMORY_LIMIT:-768m}
+    pids_limit: 256
+    logging: *observability-json-logging
+
+  tempo:
+    <<: *observability-security
+    image: ${BUZZ_TEMPO_IMAGE:-grafana/tempo:2.8.2@sha256:0ef775495967cd5d7a6b2e146b6ea695d624803c8db8349fb8ce4164f719f9b7}
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - type: bind
+        source: ./tempo/tempo.yaml
+        target: /etc/tempo/tempo.yaml
+        read_only: true
+      - type: volume
+        source: tempo-data
+        target: /var/tempo
+    networks:
+      - buzz-net
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: ${BUZZ_TEMPO_MEMORY_LIMIT:-768m}
+    pids_limit: 256
+    logging: *observability-json-logging
+
+  # Alloy reads only the host journal. It deliberately has no Docker socket:
+  # even a read-only socket mount grants mutation-capable Docker API access.
+  alloy:
+    <<: *observability-security
+    image: ${BUZZ_ALLOY_IMAGE:-grafana/alloy:v1.10.1@sha256:582f5a5169cd67a2bdbf98777c1a6f596203f573cdef5c021749fd3279605768}
+    user: "473:473"
+    group_add:
+      - "${BUZZ_SYSTEMD_JOURNAL_GID:-999}"
+      - "${BUZZ_SYSTEMD_ADM_GID:-4}"
+    command:
+      - run
+      - --disable-reporting
+      - --server.http.listen-addr=127.0.0.1:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - type: bind
+        source: ./alloy/config.alloy
+        target: /etc/alloy/config.alloy
+        read_only: true
+      - type: bind
+        source: /var/log/journal
+        target: /var/log/journal
+        read_only: true
+      - type: bind
+        source: /etc/machine-id
+        target: /etc/machine-id
+        read_only: true
+      - type: volume
+        source: alloy-data
+        target: /var/lib/alloy
+    networks:
+      - buzz-net
+    depends_on:
+      loki:
+        condition: service_started
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: ${BUZZ_ALLOY_MEMORY_LIMIT:-384m}
+    pids_limit: 256
+    logging: *observability-json-logging
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  tempo-data:
+  alloy-data:
+
+networks:
+  buzz-net:
+    external: true
+    name: ${BUZZ_DOCKER_NETWORK:-buzz-vps_buzz-net}

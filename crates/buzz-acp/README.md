@@ -113,6 +113,9 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_SESSION_STORE` | no | `$HOME/.local/state/buzz-acp/session-bindings.sqlite3` | Absolute path to the SQLite WAL database that maps Buzz conversation scopes to ACP session IDs for restart recovery. |
+| `BUZZ_ACP_SESSION_REVISION` | no | `1` | Compatibility fence for stored sessions. Change it when standing prompt, workspace, or runtime policy becomes incompatible with earlier sessions. |
+| `BUZZ_ACP_NO_SESSION_STORE` | no | `false` | Explicitly disable durable session bindings and return to process-memory-only sessions. Conflicts with `BUZZ_ACP_SESSION_STORE`. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.

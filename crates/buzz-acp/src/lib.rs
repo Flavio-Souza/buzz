@@ -12,6 +12,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
+mod session_store;
 mod setup_mode;
 mod usage;
 
@@ -1562,13 +1563,14 @@ async fn publish_relay_observer_event(
 /// Maximum age (seconds) for an observer control frame to be considered fresh.
 const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
 
-fn handle_relay_observer_control_event(
+async fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
     event_publisher: RelayEventPublisher,
+    session_store: Option<&session_store::SessionStore>,
 ) {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -1612,7 +1614,7 @@ fn handle_relay_observer_control_event(
             handle_cancel_turn_control(&payload, pool, observer);
         }
         Some("switch_model") => {
-            handle_switch_model_control(&payload, pool, observer);
+            handle_switch_model_control(&payload, pool, observer, session_store).await;
         }
         Some("publish_project_owner_announcements") => {
             handle_publish_project_owner_announcements_control(
@@ -1822,10 +1824,11 @@ fn handle_cancel_turn_control(
 /// Idle path: validate against the cached catalog *before* invalidating
 /// (pre-cancel guard), then set `desired_model` + invalidate. The override
 /// takes visible effect on the agent's next turn.
-fn handle_switch_model_control(
+async fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
+    session_store: Option<&session_store::SessionStore>,
 ) {
     let Some(channel_id) = payload
         .get("channelId")
@@ -1877,11 +1880,23 @@ fn handle_switch_model_control(
         }
     } else {
         // Idle path: validate against the cached catalog before invalidating.
-        match pool.switch_idle_agent_model(channel_id, model_id, request_id.clone()) {
+        match pool
+            .switch_idle_agent_model(channel_id, model_id, request_id.clone(), session_store)
+            .await
+        {
             IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
             IdleSwitchResult::Switched => "switched",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
+            IdleSwitchResult::SessionStoreError(error) => {
+                tracing::error!(
+                    target: "session_store",
+                    channel_id = %channel_id,
+                    %error,
+                    "model switch rejected because durable binding removal failed"
+                );
+                "failure"
+            }
         }
     };
 
@@ -2760,6 +2775,31 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
+    let session_store = config
+        .session_store_path
+        .as_deref()
+        .map(|path| {
+            session_store::SessionStore::open(
+                path,
+                &pubkey_hex,
+                &config.relay_url,
+                &config.session_revision,
+            )
+        })
+        .transpose()
+        .context("failed to initialize ACP session store")?;
+    if config.session_store_path.is_some() {
+        tracing::info!(
+            target: "session_store",
+            revision = %config.session_revision,
+            "durable ACP session bindings enabled"
+        );
+    } else {
+        tracing::warn!(
+            target: "session_store",
+            "durable ACP session bindings explicitly disabled"
+        );
+    }
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2798,6 +2838,7 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        session_store,
     });
 
     if !config.memory_enabled {
@@ -3202,7 +3243,9 @@ async fn tokio_main() -> Result<()> {
                                     observer.as_ref(),
                                     owner_hex,
                                     relay.event_publisher(),
-                                );
+                                    ctx.session_store.as_ref(),
+                                )
+                                .await;
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -3405,7 +3448,16 @@ async fn tokio_main() -> Result<()> {
                                         &scope,
                                         ControlSignal::Cancel,
                                     );
-                                    if !fired {
+                                    if fired {
+                                        if let Some(store) = ctx.session_store.as_ref() {
+                                            store.remove(&scope).await.with_context(|| {
+                                                format!(
+                                                    "failed to remove durable session binding for {}",
+                                                    scope.telemetry_label()
+                                                )
+                                            })?;
+                                        }
+                                    } else {
                                         tracing::warn!(
                                             channel_id = %buzz_event.channel_id,
                                             scope = %scope.telemetry_label(),
@@ -3452,6 +3504,14 @@ async fn tokio_main() -> Result<()> {
                                             .await,
                                         &buzz_event.event,
                                     );
+                                    if let Some(store) = ctx.session_store.as_ref() {
+                                        store.remove(&scope).await.with_context(|| {
+                                            format!(
+                                                "failed to remove durable session binding for {}",
+                                                scope.telemetry_label()
+                                            )
+                                        })?;
+                                    }
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,
@@ -6137,7 +6197,7 @@ mod owner_control_command_tests {
         });
 
         handle_cancel_turn_control(&payload, &mut pool, Some(&observer));
-        handle_switch_model_control(&payload, &mut pool, Some(&observer));
+        handle_switch_model_control(&payload, &mut pool, Some(&observer), None).await;
         let results = observer.snapshot();
         assert_eq!(results.len(), 2);
         for result in results {
@@ -6160,7 +6220,8 @@ mod owner_control_command_tests {
         pool.record_scope_owner(b, 1);
         pool.task_map_mut().clear();
         assert_eq!(
-            pool.switch_idle_agent_model(ch, "new-model", None),
+            pool.switch_idle_agent_model(ch, "new-model", None, None)
+                .await,
             IdleSwitchResult::AmbiguousTarget
         );
         assert!(!pool.channel_control_is_ambiguous(Uuid::new_v4()));
@@ -6190,7 +6251,7 @@ mod owner_control_command_tests {
                 ControlSignal::Cancel => {
                     handle_cancel_turn_control(&payload, &mut pool, Some(&observer))
                 }
-                _ => handle_switch_model_control(&payload, &mut pool, Some(&observer)),
+                _ => handle_switch_model_control(&payload, &mut pool, Some(&observer), None).await,
             }
             assert_eq!(rx.await.unwrap(), signal);
             assert_eq!(observer.snapshot()[0].payload["status"], "sent");
@@ -9148,6 +9209,8 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            session_store_path: None,
+            session_revision: "1".into(),
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -9374,6 +9437,8 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            session_store_path: None,
+            session_revision: "1".into(),
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,

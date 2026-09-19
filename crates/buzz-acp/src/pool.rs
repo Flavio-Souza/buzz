@@ -859,6 +859,9 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Optional durable mapping used to restore provider sessions after a
+    /// `buzz-acp` or adapter restart.
+    pub session_store: Option<crate::session_store::SessionStore>,
 }
 
 impl AgentPool {
@@ -1316,11 +1319,12 @@ impl AgentPool {
     /// runs a turn (no live session exists to re-emit `session_config_captured`
     /// from an idle agent). This lag is intentional: faking the emit would
     /// surface an override the session has not actually applied.
-    pub fn switch_idle_agent_model(
+    pub async fn switch_idle_agent_model(
         &mut self,
         channel_id: Uuid,
         model_id: &str,
         request_id: Option<String>,
+        session_store: Option<&crate::session_store::SessionStore>,
     ) -> IdleSwitchResult {
         if self.channel_control_is_ambiguous(channel_id) {
             return IdleSwitchResult::AmbiguousTarget;
@@ -1353,6 +1357,12 @@ impl AgentPool {
                 model_id,
             ) {
                 return IdleSwitchResult::UnsupportedModel;
+            }
+        }
+
+        if let Some(store) = session_store {
+            if let Err(error) = store.remove(&scope).await {
+                return IdleSwitchResult::SessionStoreError(error.to_string());
             }
         }
 
@@ -1400,6 +1410,8 @@ pub enum IdleSwitchResult {
     UnsupportedModel,
     /// No idle agent available (all checked out / none spawned).
     NoIdleAgent,
+    /// Durable binding could not be removed, so the live session was left intact.
+    SessionStoreError(String),
 }
 
 /// Timeout for a single pre-prompt context fetch attempt (thread/DM history).
@@ -1487,12 +1499,18 @@ struct NewSessionChannelContext<'a> {
     channel_type: Option<&'a str>,
 }
 
+#[derive(Debug)]
+struct OpenedSession {
+    session_id: String,
+    restored: bool,
+}
+
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
-) -> Result<String, AcpError> {
+) -> Result<OpenedSession, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -1532,22 +1550,94 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
-    let resp = agent
-        .acp
-        .session_new_full(
-            &ctx.cwd,
-            mcp_servers,
-            session_new_system_prompt(
-                is_goose,
-                agent.protocol_version,
-                &agent.agent_name,
-                combined_system_prompt.as_deref(),
-            ),
-            session_title.as_deref(),
-        )
-        .await?;
+    let mut restored = false;
+    let restored_response = if let (Some(store), Some(scope)) =
+        (ctx.session_store.as_ref(), channel.scope)
+    {
+        if agent.acp.load_session_supported() {
+            let binding = store
+                .lookup(scope, &agent.agent_name)
+                .await
+                .map_err(|error| AcpError::SessionStore(error.to_string()))?;
+            if let Some(session_id) = binding {
+                match agent
+                    .acp
+                    .session_load_full(&session_id, &ctx.cwd, mcp_servers.clone())
+                    .await
+                {
+                    Ok(response) => {
+                        restored = true;
+                        tracing::info!(
+                            target: "pool::session",
+                            scope = %scope.telemetry_label(),
+                            session_id,
+                            adapter = %agent.agent_name,
+                            "restored durable ACP session"
+                        );
+                        Some(response)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "pool::session",
+                            scope = %scope.telemetry_label(),
+                            session_id,
+                            adapter = %agent.agent_name,
+                            %error,
+                            "session/load failed; deleting stale binding and creating a new session"
+                        );
+                        store
+                            .remove(scope)
+                            .await
+                            .map_err(|error| AcpError::SessionStore(error.to_string()))?;
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            // An adapter downgrade must not leave a binding that a later
+            // upgrade could accidentally resume after intervening new turns.
+            store
+                .remove(scope)
+                .await
+                .map_err(|error| AcpError::SessionStore(error.to_string()))?;
+            None
+        }
+    } else {
+        None
+    };
 
-    if is_goose && agent.goose_system_prompt_supported != Some(false) {
+    let resp = match restored_response {
+        Some(response) => response,
+        None => {
+            let response = agent
+                .acp
+                .session_new_full(
+                    &ctx.cwd,
+                    mcp_servers,
+                    session_new_system_prompt(
+                        is_goose,
+                        agent.protocol_version,
+                        &agent.agent_name,
+                        combined_system_prompt.as_deref(),
+                    ),
+                    session_title.as_deref(),
+                )
+                .await?;
+            if let (Some(store), Some(scope)) = (ctx.session_store.as_ref(), channel.scope) {
+                if agent.acp.load_session_supported() {
+                    store
+                        .put(scope, &agent.agent_name, &response.session_id)
+                        .await
+                        .map_err(|error| AcpError::SessionStore(error.to_string()))?;
+                }
+            }
+            response
+        }
+    };
+
+    if !restored && is_goose && agent.goose_system_prompt_supported != Some(false) {
         if let Some(prompt) = combined_system_prompt.as_deref() {
             match agent
                 .acp
@@ -1751,7 +1841,10 @@ async fn create_session_and_apply_model(
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
-    Ok(resp.session_id)
+    Ok(OpenedSession {
+        session_id: resp.session_id,
+        restored,
+    })
 }
 
 fn mcp_servers_with_git_origin(
@@ -2523,25 +2616,37 @@ pub async fn run_prompt_task(
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    Ok(opened) => {
+                        let sid = opened.session_id;
                         tracing::info!(
                             target: "pool::session",
-                            "created session {sid} for channel {cid} (scope {})",
+                            restored = opened.restored,
+                            "opened session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
-                        agent
-                            .state
-                            .deliveries
-                            .insert(scope.clone(), ChannelDeliveryState::default());
-                        // Seed a zero usage baseline: buzz-acp spawned this session
-                        // so prior usage is zero by definition — first turn is reliable.
-                        agent.acp.notify_session_spawned(&sid);
+                        agent.state.deliveries.insert(
+                            scope.clone(),
+                            ChannelDeliveryState {
+                                // A restored adapter session already contains its
+                                // standing context and history. Re-sending the
+                                // legacy first-turn block would duplicate persona
+                                // and memory as a new user message.
+                                standing_context_sent: opened.restored,
+                                ..ChannelDeliveryState::default()
+                            },
+                        );
+                        if !opened.restored {
+                            // Seed a zero usage baseline only for a session this
+                            // process created. A restored session may have prior
+                            // cumulative usage that must not be attributed here.
+                            agent.acp.notify_session_spawned(&sid);
+                        }
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_scope, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_scope, section);
                         }
-                        (sid, true)
+                        (sid, !opened.restored)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -2589,16 +2694,21 @@ pub async fn run_prompt_task(
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    Ok(opened) => {
+                        let sid = opened.session_id;
                         tracing::info!(
                             target: "pool::session",
-                            "created heartbeat session {sid} for agent {}",
+                            restored = opened.restored,
+                            "opened heartbeat session {sid} for agent {}",
                             agent.index
                         );
                         agent.state.heartbeat_session = Some(sid.clone());
-                        // Seed a zero usage baseline: buzz-acp spawned this session.
-                        agent.acp.notify_session_spawned(&sid);
-                        (sid, true)
+                        if !opened.restored {
+                            // Heartbeats are not persisted today, so this is the
+                            // normal path; keep the guard truthful if that changes.
+                            agent.acp.notify_session_spawned(&sid);
+                        }
+                        (sid, !opened.restored)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -3262,11 +3372,35 @@ pub async fn run_prompt_task(
             };
 
             if should_rotate {
-                tracing::info!(
-                    target: "pool::session",
-                    "rotating session for {source:?} after {stop_reason:?}",
-                );
-                agent.state.invalidate(&source);
+                let durable_binding_removed = match (&source, ctx.session_store.as_ref()) {
+                    (PromptSource::Channel(scope), Some(store)) => {
+                        match store.remove(scope).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                // Keep the live session and over-limit counter so
+                                // the next completed turn retries the rotation.
+                                // Claiming rotation while a durable binding still
+                                // points at the old session would resurrect it on
+                                // restart and violate explicit session control.
+                                tracing::error!(
+                                    target: "session_store",
+                                    scope = %scope.telemetry_label(),
+                                    %error,
+                                    "session rotation deferred because durable binding removal failed"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    _ => true,
+                };
+                if durable_binding_removed {
+                    tracing::info!(
+                        target: "pool::session",
+                        "rotating session for {source:?} after {stop_reason:?}",
+                    );
+                    agent.state.invalidate(&source);
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -5168,29 +5302,21 @@ pub(crate) fn build_turn_metric_counts(
     (turn_counts, cumulative_counts)
 }
 
-/// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
-///
-/// Does nothing when `usage` is `None` (goose emitted no usage notification
-/// for this turn) or when `owner_pubkey` is unconfigured (no NIP-AO identity).
-/// Errors are logged at WARN and never surface to the caller — metric
-/// publishing must never fail a turn.
-async fn publish_agent_turn_metric(
+/// Build the exact signed event submitted by [`publish_agent_turn_metric`].
+/// Keeping construction behind one production function makes envelope,
+/// encryption, and decrypted-payload tests bind the real publisher seam.
+fn build_agent_turn_metric_event(
     ctx: &PromptContext,
-    usage: Option<crate::usage::TurnUsage>,
+    usage: &crate::usage::TurnUsage,
+    owner_pk: &nostr::PublicKey,
     channel_id: Option<uuid::Uuid>,
-    session_id: &str,
     turn_id: &str,
     stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
-) {
+) -> Result<nostr::Event, String> {
     use buzz_core::agent_turn_metric::AgentTurnMetricPayload;
     use nostr::{EventBuilder, Kind, Tag};
 
-    let (usage, owner_pk) = match (usage, ctx.agent_owner_pubkey.as_ref()) {
-        (Some(u), Some(pk)) => (u, pk),
-        _ => return,
-    };
-
-    let (turn_counts, cumulative_counts) = build_turn_metric_counts(&usage);
+    let (turn_counts, cumulative_counts) = build_turn_metric_counts(usage);
     let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let payload = AgentTurnMetricPayload {
         harness: ctx.harness_name.clone(),
@@ -5206,48 +5332,85 @@ async fn publish_agent_turn_metric(
         stop_reason,
         pricing_identity: usage.pricing_identity.clone(),
     };
-    let ciphertext = match buzz_core::agent_turn_metric::encrypt_agent_turn_metric(
+    let ciphertext = buzz_core::agent_turn_metric::encrypt_agent_turn_metric(
         &ctx.agent_keys,
         owner_pk,
         &payload,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                target: "pool::metrics",
-                session_id,
-                turn_id,
-                "NIP-AM: encrypt failed: {e}"
-            );
-            return;
-        }
-    };
+    )
+    .map_err(|error| format!("encrypt failed: {error}"))?;
     let agent_hex = ctx.agent_keys.public_key().to_hex();
     let owner_hex = owner_pk.to_hex();
-    let event = match EventBuilder::new(
+    let p_tag = Tag::parse(["p", &owner_hex]).map_err(|error| format!("p tag: {error}"))?;
+    let agent_tag =
+        Tag::parse(["agent", &agent_hex]).map_err(|error| format!("agent tag: {error}"))?;
+    EventBuilder::new(
         Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_METRIC as u16),
         ciphertext,
     )
-    .tags([
-        Tag::parse(["p", &owner_hex]).expect("p tag"),
-        Tag::parse(["agent", &agent_hex]).expect("agent tag"),
-    ])
+    .tags([p_tag, agent_tag])
     .sign_with_keys(&ctx.agent_keys)
-    {
-        Ok(e) => e,
-        Err(e) => {
+    .map_err(|error| format!("sign failed: {error}"))
+}
+
+/// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
+///
+/// Does nothing when `usage` is `None` (the adapter emitted no publishable
+/// counters). Missing ownership and every construction/transport failure are
+/// logged at WARN and never fail the user turn.
+async fn publish_agent_turn_metric(
+    ctx: &PromptContext,
+    usage: Option<crate::usage::TurnUsage>,
+    channel_id: Option<uuid::Uuid>,
+    session_id: &str,
+    turn_id: &str,
+    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+) {
+    let Some(usage) = usage else {
+        tracing::debug!(
+            target: "pool::metrics",
+            session_id,
+            turn_id,
+            "NIP-AM: no publishable usage observed for completed turn"
+        );
+        return;
+    };
+    let Some(owner_pk) = ctx.agent_owner_pubkey.as_ref() else {
+        tracing::warn!(
+            target: "pool::metrics",
+            session_id,
+            turn_id,
+            "NIP-AM: usage observed but agent owner is unavailable"
+        );
+        return;
+    };
+    let event = match build_agent_turn_metric_event(
+        ctx,
+        &usage,
+        owner_pk,
+        channel_id,
+        turn_id,
+        stop_reason,
+    ) {
+        Ok(event) => event,
+        Err(error) => {
             tracing::warn!(
                 target: "pool::metrics",
                 session_id,
                 turn_id,
-                "NIP-AM: sign failed: {e}"
+                "NIP-AM: {error}"
             );
             return;
         }
     };
     const METRIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     match tokio::time::timeout(METRIC_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => tracing::debug!(
+            target: "pool::metrics",
+            session_id,
+            turn_id,
+            event_id = %event.id,
+            "NIP-AM: published kind 44200"
+        ),
         Ok(Err(e)) => tracing::warn!(
             target: "pool::metrics",
             session_id,
@@ -9584,6 +9747,61 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         .await;
     }
 
+    /// The production event builder must produce an owner-decryptable kind
+    /// 44200 envelope. This is the seam immediately before REST submission;
+    /// changing the production kind, tags, payload mapping, or encryption keys
+    /// makes the test fail.
+    #[test]
+    fn test_build_agent_turn_metric_event_is_decryptable_kind_44200() {
+        let agent_keys = nostr::Keys::generate();
+        let owner_keys = nostr::Keys::generate();
+        let ctx = make_prompt_context_with_owner(&agent_keys, owner_keys.public_key());
+        let usage = crate::usage::TurnUsage {
+            session_id: "sess-codex".to_string(),
+            turn_seq: 1,
+            delta_reliable: true,
+            turn_input_tokens: Some(130),
+            turn_output_tokens: Some(10),
+            turn_total_tokens: Some(140),
+            turn_cost_usd: None,
+            turn_cache_read_tokens: Some(40),
+            turn_cache_write_tokens: None,
+            cumulative_input_tokens: None,
+            cumulative_output_tokens: None,
+            cumulative_total_tokens: None,
+            cumulative_cost_usd: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
+            model: Some("gpt-test".to_string()),
+            pricing_identity: None,
+        };
+
+        let event = build_agent_turn_metric_event(
+            &ctx,
+            &usage,
+            &owner_keys.public_key(),
+            Some(uuid::Uuid::nil()),
+            "turn-codex",
+            Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+        )
+        .expect("build metric event");
+
+        assert_eq!(
+            event.kind.as_u16(),
+            buzz_core::kind::KIND_AGENT_TURN_METRIC as u16
+        );
+        assert_eq!(event.pubkey, agent_keys.public_key());
+        let payload = buzz_core::agent_turn_metric::decrypt_agent_turn_metric(&owner_keys, &event)
+            .expect("owner decrypts metric");
+        assert_eq!(payload.session_id.as_deref(), Some("sess-codex"));
+        assert_eq!(payload.turn_id.as_deref(), Some("turn-codex"));
+        let turn = payload.turn.expect("turn counts");
+        assert_eq!(turn.input_tokens, Some(130));
+        assert_eq!(turn.output_tokens, Some(10));
+        assert_eq!(turn.total_tokens, Some(140));
+        assert_eq!(turn.cache_read_tokens, Some(40));
+    }
+
     /// `publish_agent_turn_metric` encrypts the payload when owner is present
     /// (the HTTP submit will fail in tests, but we verify no panic and the
     /// encrypt/sign path executes).
@@ -9961,6 +10179,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            session_store: None,
         }
     }
 
@@ -11223,6 +11442,161 @@ exit 0"#
 }
 
 #[cfg(test)]
+mod durable_session_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+    use crate::session_store::SessionStore;
+    use tests::make_prompt_context_no_owner;
+
+    async fn restore_agent(script: String) -> OwnedAgent {
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn scripted ACP adapter");
+        let initialized = acp.initialize().await.expect("initialize adapter");
+        assert_eq!(
+            initialized
+                .pointer("/agentCapabilities/loadSession")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "restore-test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        }
+    }
+
+    fn store_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "buzz-acp-pool-session-{label}-{}.sqlite3",
+            Uuid::new_v4()
+        ))
+    }
+
+    fn scope() -> SessionScope {
+        SessionScope::Thread {
+            channel_id: Uuid::new_v4(),
+            root_event_id: "ab".repeat(32),
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_binding_uses_session_load_instead_of_session_new() {
+        let path = store_path("load");
+        let store =
+            SessionStore::open(&path, "agent", "wss://buzz.example", "v1").expect("open store");
+        let scope = scope();
+        store
+            .put(&scope, "restore-test", "existing-session")
+            .await
+            .expect("seed binding");
+
+        let script = r#"
+read -r _init
+echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"restore-test"},"agentCapabilities":{"loadSession":true}}}'
+read -r request
+case "$request" in
+  *'"method":"session/load"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"configOptions":[]}}' ;;
+  *) echo '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"expected session/load"}}' ;;
+esac
+sleep 1
+"#
+        .to_string();
+        let mut agent = restore_agent(script).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.session_store = Some(store);
+
+        let opened = create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: Some(&scope),
+                channel_type: Some("stream"),
+            },
+        )
+        .await
+        .expect("restore existing session");
+        assert!(opened.restored);
+        assert_eq!(opened.session_id, "existing-session");
+
+        drop(agent);
+        drop(ctx);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn rejected_load_deletes_binding_creates_new_and_rebinds() {
+        let path = store_path("fallback");
+        let store =
+            SessionStore::open(&path, "agent", "wss://buzz.example", "v1").expect("open store");
+        let scope = scope();
+        store
+            .put(&scope, "restore-test", "stale-session")
+            .await
+            .expect("seed binding");
+
+        let script = r#"
+read -r _init
+echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"restore-test"},"agentCapabilities":{"loadSession":true}}}'
+read -r load
+echo '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"session missing"}}'
+read -r create
+case "$create" in
+  *'"method":"session/new"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"replacement-session","configOptions":[]}}' ;;
+  *) echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"expected session/new"}}' ;;
+esac
+sleep 1
+"#
+        .to_string();
+        let mut agent = restore_agent(script).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.session_store = Some(store.clone());
+
+        let opened = create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: Some(&scope),
+                channel_type: Some("stream"),
+            },
+        )
+        .await
+        .expect("fallback to new session");
+        assert!(!opened.restored);
+        assert_eq!(opened.session_id, "replacement-session");
+        assert_eq!(
+            store
+                .lookup(&scope, "restore-test")
+                .await
+                .expect("lookup replacement"),
+            Some("replacement-session".to_string())
+        );
+
+        drop(agent);
+        drop(ctx);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
 mod model_switch_tests {
     use super::*;
     use crate::acp::AcpClient;
@@ -11418,7 +11792,8 @@ done"#
         let original_sessions = agent.state.sessions.clone();
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
         assert_eq!(
-            pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into())),
+            pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into()), None)
+                .await,
             IdleSwitchResult::AmbiguousTarget,
         );
         let agent = pool.agents[0].as_ref().unwrap();
@@ -11433,7 +11808,8 @@ done"#
         pool.held_since
             .insert(scopes[0].clone(), tokio::time::Instant::now());
         assert_eq!(
-            pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into())),
+            pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into()), None)
+                .await,
             IdleSwitchResult::Switched,
         );
         let agent = pool.agents[0].as_ref().unwrap();

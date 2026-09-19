@@ -1490,6 +1490,16 @@ pub(crate) mod tests {
         build_test_state(config, pool).await
     }
 
+    /// Build test state around an explicit production configuration and writer
+    /// pool. Integration tests use this when the configuration itself is part
+    /// of the seam under test (for example closed-relay NIP-OA admission).
+    pub(crate) async fn test_state_with_config_and_database_pool(
+        config: crate::config::Config,
+        pool: sqlx::PgPool,
+    ) -> Arc<AppState> {
+        build_test_state(config, pool).await
+    }
+
     async fn build_test_state(config: crate::config::Config, pool: sqlx::PgPool) -> Arc<AppState> {
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)

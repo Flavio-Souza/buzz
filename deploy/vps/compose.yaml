@@ -1,0 +1,83 @@
+name: buzz-vps
+
+# Single-node Buzz deployment. Postgres and Redis live on db. MinIO provides
+# the S3-compatible object store expected by Buzz for media and Git objects.
+x-logging: &buzz-json-logging
+  driver: json-file
+  options:
+    max-size: "${BUZZ_DOCKER_LOG_MAX_SIZE:-50m}"
+    max-file: "${BUZZ_DOCKER_LOG_MAX_FILES:-5}"
+
+services:
+  relay:
+    image: ${BUZZ_IMAGE}
+    env_file:
+      - .env
+    ports:
+      - "${BUZZ_BIND_HOST:-10.20.0.1}:${BUZZ_HTTP_PORT:-3300}:3000"
+    networks:
+      - buzz-net
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - type: bind
+        source: ${BUZZ_GIT_DATA_DIR}
+        target: /data/git
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/${BUZZ_HEALTH_PORT:-8080};
+          printf "GET /_readiness HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection:
+          close\r\n\r\n" >&3; grep -q "200 OK" <&3'
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    logging: *buzz-json-logging
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
+    volumes:
+      - type: bind
+        source: ${BUZZ_S3_DATA_DIR}
+        target: /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging: *buzz-json-logging
+    restart: unless-stopped
+    networks:
+      - buzz-net
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
+      BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
+      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
+    entrypoint: >-
+      /bin/sh -euc 'mc alias set local http://minio:9000
+      "$${BUZZ_S3_ACCESS_KEY}" "$${BUZZ_S3_SECRET_KEY}";
+      mc mb --ignore-existing "local/$${BUZZ_S3_BUCKET}";
+      mc anonymous set none "local/$${BUZZ_S3_BUCKET}"'
+    logging: *buzz-json-logging
+    restart: "no"
+    networks:
+      - buzz-net
+
+networks:
+  buzz-net:
+    driver: bridge

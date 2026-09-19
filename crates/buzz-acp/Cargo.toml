@@ -68,6 +68,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Config file
 toml = "1.0"
 
+# Durable ACP session bindings
+rusqlite = { version = "0.37", features = ["bundled"] }
+
 # Filter expressions
 evalexpr = { workspace = true }
 

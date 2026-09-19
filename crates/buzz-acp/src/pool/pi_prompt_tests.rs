@@ -271,7 +271,7 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
     ctx.system_prompt = Some("BUZZ_PERSONA".into());
     ctx.team_instructions = Some("BUZZ_TEAM".into());
     ctx.session_title = Some("Pi fixture".into());
-    let id = create_session_and_apply_model(
+    let opened = create_session_and_apply_model(
         &mut agent,
         &ctx,
         Some("<core-memory>BUZZ_CORE</core-memory>"),
@@ -285,6 +285,8 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
     )
     .await
     .unwrap();
+    assert!(!opened.restored);
+    let id = opened.session_id;
     let metadata = std::fs::read_dir(home.join(".pi/buzz-pi-acp/sessions"))
         .unwrap()
         .find_map(|entry| {
